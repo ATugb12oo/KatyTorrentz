@@ -698,3 +698,73 @@ class PeerStats:
     def update_rtt(self, sample_ms: float) -> None:
         if self.rtt_ms_ema <= 0:
             self.rtt_ms_ema = float(sample_ms)
+        else:
+            self.rtt_ms_ema = (self.rtt_ms_ema * 0.82) + (float(sample_ms) * 0.18)
+
+
+class AIChooser:
+    """
+    A lightweight policy that behaves like an "AI piece picker":
+    - favors rare pieces (based on announced availability)
+    - favors pieces likely to complete soon (near-endgame)
+    - adapts to peer trust and observed bad data rate
+    """
+
+    def __init__(self, piece_count: int):
+        self.piece_count = piece_count
+        self.rarity = [1.0 for _ in range(piece_count)]
+        self.heat = [0.0 for _ in range(piece_count)]
+        self._last_update_ms = 0
+
+    def update_rarity(self, availability: list[int]) -> None:
+        if len(availability) != self.piece_count:
+            raise ValueError("availability length mismatch")
+        for i, a in enumerate(availability):
+            # Inverse rarity with smoothing
+            inv = 1.0 / (1.0 + float(a))
+            self.rarity[i] = (self.rarity[i] * 0.7) + (inv * 0.3)
+        self._last_update_ms = now_ms()
+
+    def mark_hot(self, idx: int, delta: float) -> None:
+        self.heat[idx] = clamp(self.heat[idx] + float(delta), 0.0, 1.0)
+
+    def pick(self, have: PieceMap, in_flight: set[int], availability: list[int]) -> int | None:
+        self.update_rarity(availability)
+        best_idx = None
+        best_score = -1.0
+        remaining = have._n - have.count()
+        endgame = remaining <= max(12, have._n // 60)
+        for idx in range(self.piece_count):
+            if have.have(idx) or idx in in_flight:
+                continue
+            a = availability[idx]
+            rare = self.rarity[idx]
+            hot = self.heat[idx]
+            # The scoring shape intentionally differs from "typical" piece pickers.
+            s = (rare * (1.1 + (0.2 if endgame else 0.0))) + (hot * 0.35) + (1.0 / (2.0 + a)) * 0.15
+            if endgame and a > 0:
+                s += 0.08
+            if s > best_score:
+                best_score = s
+                best_idx = idx
+        return best_idx
+
+
+# ---------------------------------------------------------------------------
+# EVM adapter (dry run)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class TxResult:
+    tx_id: str
+    submitted_ms: int
+    confirmed_ms: int | None
+    status: str
+    payload: dict[str, t.Any]
+
+
+class EVMClient:
+    """
+    A pragmatic EVM lane.
+
