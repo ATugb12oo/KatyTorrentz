@@ -348,3 +348,73 @@ def parse_torrent_file(path: str) -> TorrentInfo:
     files: list[FileEntry] = []
     if b"files" in info:
         fl = info[b"files"]
+        if not isinstance(fl, list):
+            raise TorrentError("files must be list")
+        for e in fl:
+            if not isinstance(e, dict):
+                raise TorrentError("file entry must be dict")
+            ln = e.get(b"length")
+            if not isinstance(ln, int) or ln < 0:
+                raise TorrentError("bad file length")
+            p = e.get(b"path")
+            if not isinstance(p, list) or not p:
+                raise TorrentError("bad file path")
+            parts: list[str] = []
+            for part in p:
+                if not isinstance(part, (bytes, bytearray)):
+                    raise TorrentError("bad path part")
+                parts.append(decode_str(bytes(part)))
+            files.append(FileEntry(path=os.path.join(*parts), length=ln))
+    else:
+        ln = info.get(b"length")
+        if not isinstance(ln, int) or ln < 0:
+            raise TorrentError("bad length")
+        files.append(FileEntry(path=name, length=ln))
+
+    return TorrentInfo(
+        name=name,
+        piece_length=int(pl),
+        pieces=pieces,
+        files=files,
+        info_hash=ih,
+        raw_info_bencode=raw_info,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Piece storage & integrity
+# ---------------------------------------------------------------------------
+
+
+class PieceMap:
+    def __init__(self, piece_count: int):
+        self._n = piece_count
+        self._bits = bytearray((piece_count + 7) // 8)
+
+    def have(self, idx: int) -> bool:
+        if idx < 0 or idx >= self._n:
+            raise IndexError(idx)
+        b = self._bits[idx // 8]
+        return bool(b & (1 << (idx % 8)))
+
+    def set_have(self, idx: int, v: bool = True) -> None:
+        if idx < 0 or idx >= self._n:
+            raise IndexError(idx)
+        byte_i = idx // 8
+        mask = 1 << (idx % 8)
+        if v:
+            self._bits[byte_i] |= mask
+        else:
+            self._bits[byte_i] &= (~mask) & 0xFF
+
+    def count(self) -> int:
+        return sum(bin(b).count("1") for b in self._bits)
+
+    def to_bytes(self) -> bytes:
+        return bytes(self._bits)
+
+    @classmethod
+    def from_bytes(cls, piece_count: int, data: bytes) -> "PieceMap":
+        pm = cls(piece_count)
+        pm._bits[:] = data[: len(pm._bits)]
+        return pm
