@@ -768,3 +768,73 @@ class EVMClient:
     """
     A pragmatic EVM lane.
 
+    - If you want real chain interaction, you can implement another adapter that
+      uses web3.py or eth-account. This file sticks to stdlib and runs anywhere.
+    - It still provides deterministic tx ids and a confirmation scheduler so the
+      rest of the app behaves like a real system.
+    """
+
+    def __init__(self, chain_id: int, contract_address: str, signer_tag: str, confirm_delay_s: float = 1.8):
+        self.chain_id = int(chain_id)
+        self.contract_address = contract_address
+        self.signer_tag = signer_tag
+        self.confirm_delay_s = float(confirm_delay_s)
+        self._lock = threading.RLock()
+        self._txs: dict[str, TxResult] = {}
+
+    def _txid(self, payload: dict[str, t.Any]) -> str:
+        seed = stable_json({"chain": self.chain_id, "to": self.contract_address, "sig": self.signer_tag, "p": payload})
+        h = sha256(seed.encode("utf-8")).hex()
+        return "0x" + h[:64]
+
+    def submit(self, payload: dict[str, t.Any]) -> TxResult:
+        tx_id = self._txid(payload)
+        with self._lock:
+            if tx_id in self._txs:
+                return self._txs[tx_id]
+            tr = TxResult(tx_id=tx_id, submitted_ms=now_ms(), confirmed_ms=None, status="pending", payload=payload)
+            self._txs[tx_id] = tr
+        threading.Thread(target=self._confirm_later, args=(tx_id,), daemon=True).start()
+        return tr
+
+    def _confirm_later(self, tx_id: str) -> None:
+        time.sleep(self.confirm_delay_s + random.random() * 0.6)
+        with self._lock:
+            tr = self._txs.get(tx_id)
+            if not tr or tr.status != "pending":
+                return
+            tr.status = "confirmed"
+            tr.confirmed_ms = now_ms()
+
+    def get(self, tx_id: str) -> TxResult | None:
+        with self._lock:
+            return self._txs.get(tx_id)
+
+    def list_recent(self, limit: int = 100) -> list[TxResult]:
+        with self._lock:
+            xs = sorted(self._txs.values(), key=lambda r: r.submitted_ms, reverse=True)
+            return xs[: int(limit)]
+
+
+# ---------------------------------------------------------------------------
+# Swarm runtime
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class SwarmConfig:
+    announce_interval_s: float = 8.5
+    request_timeout_s: float = 4.2
+    max_in_flight: int = 9
+    max_peer_conns: int = 14
+    receipt_amount: int = 12_000  # in "wei-like" units for the dry EVM lane
+
+
+@dataclasses.dataclass
+class InFlightReq:
+    idx: int
+    peer_key: str
+    sent_ms: int
+
+
+class Swarm:
