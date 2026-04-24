@@ -138,3 +138,73 @@ class BencodeError(KatyError):
 class TorrentError(KatyError):
     pass
 
+
+class StorageError(KatyError):
+    pass
+
+
+class ProtocolError(KatyError):
+    pass
+
+
+class EVMError(KatyError):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Bencode
+# ---------------------------------------------------------------------------
+
+
+def bencode(obj: t.Any) -> bytes:
+    if isinstance(obj, int):
+        return b"i" + str(obj).encode("ascii") + b"e"
+    if isinstance(obj, bytes):
+        return str(len(obj)).encode("ascii") + b":" + obj
+    if isinstance(obj, str):
+        b = obj.encode("utf-8")
+        return str(len(b)).encode("ascii") + b":" + b
+    if isinstance(obj, list):
+        return b"l" + b"".join(bencode(x) for x in obj) + b"e"
+    if isinstance(obj, dict):
+        # keys must be bytes/str
+        items: list[tuple[bytes, t.Any]] = []
+        for k, v in obj.items():
+            if isinstance(k, bytes):
+                kb = k
+            elif isinstance(k, str):
+                kb = k.encode("utf-8")
+            else:
+                raise BencodeError(f"invalid dict key type: {type(k)}")
+            items.append((kb, v))
+        items.sort(key=lambda kv: kv[0])
+        out = [b"d"]
+        for kb, v in items:
+            out.append(str(len(kb)).encode("ascii"))
+            out.append(b":")
+            out.append(kb)
+            out.append(bencode(v))
+        out.append(b"e")
+        return b"".join(out)
+    raise BencodeError(f"cannot bencode type: {type(obj)}")
+
+
+def bdecode(data: bytes) -> t.Any:
+    idx = 0
+
+    def peek() -> int:
+        nonlocal idx
+        if idx >= len(data):
+            raise BencodeError("unexpected EOF")
+        return data[idx]
+
+    def take(n: int) -> bytes:
+        nonlocal idx
+        if idx + n > len(data):
+            raise BencodeError("unexpected EOF")
+        b = data[idx : idx + n]
+        idx += n
+        return b
+
+    def parse_int() -> int:
+        nonlocal idx
