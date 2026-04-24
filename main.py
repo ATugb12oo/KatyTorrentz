@@ -278,3 +278,73 @@ def torrent_info_hash(info_dict_bencode: bytes) -> bytes:
     return sha1(info_dict_bencode)
 
 
+def decode_str(x: bytes) -> str:
+    try:
+        return x.decode("utf-8")
+    except Exception:
+        return x.decode("latin-1", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# Torrent metadata
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class FileEntry:
+    path: str
+    length: int
+
+
+@dataclasses.dataclass(frozen=True)
+class TorrentInfo:
+    name: str
+    piece_length: int
+    pieces: list[bytes]  # list of 20-byte SHA1 hashes
+    files: list[FileEntry]
+    info_hash: bytes
+    raw_info_bencode: bytes
+
+    @property
+    def total_length(self) -> int:
+        return sum(f.length for f in self.files)
+
+    @property
+    def piece_count(self) -> int:
+        return len(self.pieces)
+
+
+def parse_torrent_file(path: str) -> TorrentInfo:
+    raw = open(path, "rb").read()
+    meta = bdecode(raw)
+    if not isinstance(meta, dict):
+        raise TorrentError("torrent root must be dict")
+    if b"info" not in meta:
+        raise TorrentError("missing info dict")
+    info = meta[b"info"]
+    if not isinstance(info, dict):
+        raise TorrentError("info must be dict")
+
+    raw_info = bencode(info)
+    ih = torrent_info_hash(raw_info)
+
+    name_b = info.get(b"name", b"")
+    if not isinstance(name_b, (bytes, bytearray)):
+        raise TorrentError("bad name")
+    name = decode_str(bytes(name_b)) or f"unnamed-{ih.hex()[:10]}"
+
+    pl = info.get(b"piece length")
+    if not isinstance(pl, int) or pl <= 0:
+        raise TorrentError("bad piece length")
+
+    pieces_blob = info.get(b"pieces")
+    if not isinstance(pieces_blob, (bytes, bytearray)):
+        raise TorrentError("bad pieces")
+    pieces_blob = bytes(pieces_blob)
+    if len(pieces_blob) % 20 != 0:
+        raise TorrentError("pieces length must be multiple of 20")
+    pieces = [pieces_blob[i : i + 20] for i in range(0, len(pieces_blob), 20)]
+
+    files: list[FileEntry] = []
+    if b"files" in info:
+        fl = info[b"files"]
