@@ -488,3 +488,73 @@ CREATE TABLE IF NOT EXISTS pieces (
   FOREIGN KEY(info_hash) REFERENCES torrents(info_hash) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS peers (
+  info_hash TEXT NOT NULL,
+  peer_key TEXT NOT NULL,
+  addr TEXT NOT NULL,
+  port INTEGER NOT NULL,
+  last_seen_ms INTEGER NOT NULL,
+  score REAL NOT NULL,
+  flags INTEGER NOT NULL,
+  PRIMARY KEY (info_hash, peer_key),
+  FOREIGN KEY(info_hash) REFERENCES torrents(info_hash) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS receipts (
+  id TEXT PRIMARY KEY,
+  info_hash TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  created_ms INTEGER NOT NULL,
+  piece_idx INTEGER NOT NULL,
+  amount INTEGER NOT NULL,
+  digest_hex TEXT NOT NULL,
+  status TEXT NOT NULL,
+  tx_id TEXT,
+  FOREIGN KEY(info_hash) REFERENCES torrents(info_hash) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
+"""
+
+
+class StateDB:
+    def __init__(self, path: str):
+        self.path = path
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+        self._apply_schema()
+
+    def _apply_schema(self) -> None:
+        with self._conn:
+            self._conn.executescript(SCHEMA)
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def set_kv(self, k: str, v: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+
+    def get_kv(self, k: str, default: str | None = None) -> str | None:
+        with self._lock:
+            row = self._conn.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+            if not row:
+                return default
+            return t.cast(str, row["v"])
+
+    def add_torrent(self, ti: TorrentInfo) -> None:
+        with self._lock, self._conn:
+            ih = ti.info_hash.hex()
+            self._conn.execute(
+                "INSERT OR REPLACE INTO torrents(info_hash,name,created_at,piece_length,piece_count,total_length,raw_info_b64) VALUES(?,?,?,?,?,?,?)",
+                (
+                    ih,
+                    ti.name,
+                    int(time.time()),
+                    ti.piece_length,
+                    ti.piece_count,
