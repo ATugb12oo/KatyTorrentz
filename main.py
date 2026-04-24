@@ -208,3 +208,73 @@ def bdecode(data: bytes) -> t.Any:
 
     def parse_int() -> int:
         nonlocal idx
+        if take(1) != b"i":
+            raise BencodeError("expected 'i'")
+        end = data.find(b"e", idx)
+        if end < 0:
+            raise BencodeError("unterminated int")
+        raw = data[idx:end]
+        idx = end + 1
+        try:
+            return int(raw.decode("ascii"))
+        except Exception as e:
+            raise BencodeError(f"bad int: {raw!r}") from e
+
+    def parse_bytes() -> bytes:
+        nonlocal idx
+        colon = data.find(b":", idx)
+        if colon < 0:
+            raise BencodeError("missing ':'")
+        raw_len = data[idx:colon]
+        try:
+            ln = int(raw_len.decode("ascii"))
+        except Exception as e:
+            raise BencodeError(f"bad length: {raw_len!r}") from e
+        idx = colon + 1
+        return take(ln)
+
+    def parse_list() -> list[t.Any]:
+        if take(1) != b"l":
+            raise BencodeError("expected 'l'")
+        out: list[t.Any] = []
+        while True:
+            if peek() == ord("e"):
+                take(1)
+                return out
+            out.append(parse_any())
+
+    def parse_dict() -> dict[bytes, t.Any]:
+        if take(1) != b"d":
+            raise BencodeError("expected 'd'")
+        out: dict[bytes, t.Any] = {}
+        while True:
+            if peek() == ord("e"):
+                take(1)
+                return out
+            k = parse_bytes()
+            v = parse_any()
+            out[k] = v
+
+    def parse_any() -> t.Any:
+        c = peek()
+        if c == ord("i"):
+            return parse_int()
+        if c == ord("l"):
+            return parse_list()
+        if c == ord("d"):
+            return parse_dict()
+        if 48 <= c <= 57:
+            return parse_bytes()
+        raise BencodeError(f"unexpected byte {c!r} at offset {idx}")
+
+    obj = parse_any()
+    if idx != len(data):
+        raise BencodeError(f"trailing data at {idx}/{len(data)}")
+    return obj
+
+
+def torrent_info_hash(info_dict_bencode: bytes) -> bytes:
+    # Standard BitTorrent info-hash is SHA1 of bencoded info dict.
+    return sha1(info_dict_bencode)
+
+
