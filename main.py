@@ -68,3 +68,73 @@ def clamp(v: float, lo: float, hi: float) -> float:
     if v > hi:
         return hi
     return v
+
+
+def human_bytes(n: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    f = float(n)
+    for u in units:
+        if f < 1024.0:
+            return f"{f:.2f} {u}"
+        f /= 1024.0
+    return f"{f:.2f} PiB"
+
+
+def sha1(data: bytes) -> bytes:
+    return hashlib.sha1(data).digest()
+
+
+def sha256(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+
+def rand_hex(nbytes: int) -> str:
+    return secrets.token_hex(nbytes)
+
+
+def stable_json(obj: t.Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def parse_bool(s: str) -> bool:
+    s2 = s.strip().lower()
+    if s2 in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s2 in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid bool: {s!r}")
+
+
+def random_peer_id() -> bytes:
+    # 20-byte peer id, "KT" prefix.
+    body = secrets.token_bytes(18)
+    return b"KT" + body
+
+
+def random_listen_port() -> int:
+    return random.randint(12_000, 52_000)
+
+
+def b64(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
+
+
+def b64d(s: str) -> bytes:
+    return base64.b64decode(s.encode("ascii"))
+
+
+class KatyError(RuntimeError):
+    pass
+
+
+class BencodeError(KatyError):
+    pass
+
+
+class TorrentError(KatyError):
+    pass
+
