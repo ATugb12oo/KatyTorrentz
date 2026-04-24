@@ -558,3 +558,73 @@ class StateDB:
                     int(time.time()),
                     ti.piece_length,
                     ti.piece_count,
+                    ti.total_length,
+                    b64(ti.raw_info_bencode),
+                ),
+            )
+            rows = [(ih, i, 0, 0, 0) for i in range(ti.piece_count)]
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO pieces(info_hash,idx,have,verified,last_write_ms) VALUES(?,?,?,?,?)",
+                rows,
+            )
+
+    def list_torrents(self) -> list[dict[str, t.Any]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM torrents ORDER BY created_at DESC").fetchall()
+            out: list[dict[str, t.Any]] = []
+            for r in rows:
+                out.append(dict(r))
+            return out
+
+    def get_torrent(self, info_hash_hex: str) -> dict[str, t.Any] | None:
+        with self._lock:
+            r = self._conn.execute("SELECT * FROM torrents WHERE info_hash=?", (info_hash_hex,)).fetchone()
+            return dict(r) if r else None
+
+    def update_piece(self, info_hash_hex: str, idx: int, have: bool, verified: bool) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE pieces SET have=?, verified=?, last_write_ms=? WHERE info_hash=? AND idx=?",
+                (1 if have else 0, 1 if verified else 0, now_ms(), info_hash_hex, idx),
+            )
+
+    def piece_map(self, info_hash_hex: str, piece_count: int) -> PieceMap:
+        with self._lock:
+            rows = self._conn.execute("SELECT idx,have FROM pieces WHERE info_hash=? ORDER BY idx ASC", (info_hash_hex,)).fetchall()
+            pm = PieceMap(piece_count)
+            for r in rows:
+                if int(r["have"]) == 1:
+                    pm.set_have(int(r["idx"]), True)
+            return pm
+
+    def peer_touch(self, info_hash_hex: str, peer_key: str, addr: str, port: int, score: float, flags: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO peers(info_hash,peer_key,addr,port,last_seen_ms,score,flags) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(info_hash,peer_key) DO UPDATE SET addr=excluded.addr, port=excluded.port, last_seen_ms=excluded.last_seen_ms, score=excluded.score, flags=excluded.flags",
+                (info_hash_hex, peer_key, addr, port, now_ms(), float(score), int(flags)),
+            )
+
+    def list_peers(self, info_hash_hex: str, limit: int = 200) -> list[dict[str, t.Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM peers WHERE info_hash=? ORDER BY last_seen_ms DESC LIMIT ?",
+                (info_hash_hex, int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def add_receipt(self, receipt_id: str, info_hash_hex: str, kind: str, piece_idx: int, amount: int, digest_hex: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO receipts(id,info_hash,kind,created_ms,piece_idx,amount,digest_hex,status,tx_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (receipt_id, info_hash_hex, kind, now_ms(), int(piece_idx), int(amount), digest_hex, "queued", None),
+            )
+
+    def list_receipts(self, info_hash_hex: str, limit: int = 200) -> list[dict[str, t.Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM receipts WHERE info_hash=? ORDER BY created_ms DESC LIMIT ?",
+                (info_hash_hex, int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
