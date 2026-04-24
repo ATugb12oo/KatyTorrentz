@@ -418,3 +418,73 @@ class PieceMap:
         pm = cls(piece_count)
         pm._bits[:] = data[: len(pm._bits)]
         return pm
+
+
+class PieceStore:
+    def __init__(self, base_dir: str, info_hash: bytes, piece_length: int, piece_count: int):
+        self.base_dir = base_dir
+        self.info_hash = info_hash
+        self.piece_length = piece_length
+        self.piece_count = piece_count
+        self._dir = os.path.join(base_dir, "pieces", info_hash.hex())
+        os.makedirs(self._dir, exist_ok=True)
+
+    def _piece_path(self, idx: int) -> str:
+        if idx < 0 or idx >= self.piece_count:
+            raise StorageError(f"piece index out of range: {idx}")
+        return os.path.join(self._dir, f"{idx:06d}.bin")
+
+    def has_piece(self, idx: int) -> bool:
+        return os.path.exists(self._piece_path(idx))
+
+    def read_piece(self, idx: int) -> bytes:
+        p = self._piece_path(idx)
+        try:
+            return open(p, "rb").read()
+        except FileNotFoundError:
+            raise StorageError(f"missing piece: {idx}")
+
+    def write_piece(self, idx: int, data: bytes) -> None:
+        if len(data) > self.piece_length:
+            raise StorageError("piece too long")
+        p = self._piece_path(idx)
+        tmp = p + f".tmp-{uuid.uuid4().hex}"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, p)
+
+    def verify_piece(self, idx: int, data: bytes, expected_sha1: bytes) -> bool:
+        if len(expected_sha1) != 20:
+            raise StorageError("expected sha1 must be 20 bytes")
+        return sha1(data) == expected_sha1
+
+
+# ---------------------------------------------------------------------------
+# SQLite state
+# ---------------------------------------------------------------------------
+
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS torrents (
+  info_hash TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  piece_length INTEGER NOT NULL,
+  piece_count INTEGER NOT NULL,
+  total_length INTEGER NOT NULL,
+  raw_info_b64 TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pieces (
+  info_hash TEXT NOT NULL,
+  idx INTEGER NOT NULL,
+  have INTEGER NOT NULL,
+  verified INTEGER NOT NULL,
+  last_write_ms INTEGER NOT NULL,
+  PRIMARY KEY (info_hash, idx),
+  FOREIGN KEY(info_hash) REFERENCES torrents(info_hash) ON DELETE CASCADE
+);
+
