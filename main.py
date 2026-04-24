@@ -628,3 +628,73 @@ class StateDB:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def set_receipt_status(self, receipt_id: str, status: str, tx_id: str | None = None) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE receipts SET status=?, tx_id=? WHERE id=?", (status, tx_id, receipt_id))
+
+
+# ---------------------------------------------------------------------------
+# Peer protocol simulation
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class PeerIdentity:
+    peer_id: bytes
+    key: str
+    addr: str
+    port: int
+
+
+class MessageCodec:
+    """
+    A minimal length-prefixed codec inspired by BT messages.
+    Frame = uint32_be_len | payload
+    payload = json bytes
+    """
+
+    @staticmethod
+    def encode(obj: dict[str, t.Any]) -> bytes:
+        payload = stable_json(obj).encode("utf-8")
+        return struct.pack(">I", len(payload)) + payload
+
+    @staticmethod
+    def decode_stream(buf: bytearray) -> list[dict[str, t.Any]]:
+        out: list[dict[str, t.Any]] = []
+        while True:
+            if len(buf) < 4:
+                return out
+            (ln,) = struct.unpack(">I", buf[:4])
+            if ln < 2 or ln > 2_000_000:
+                raise ProtocolError(f"frame length out of range: {ln}")
+            if len(buf) < 4 + ln:
+                return out
+            payload = bytes(buf[4 : 4 + ln])
+            del buf[: 4 + ln]
+            try:
+                out.append(json.loads(payload.decode("utf-8")))
+            except Exception as e:
+                raise ProtocolError("bad json frame") from e
+
+
+@dataclasses.dataclass
+class PeerStats:
+    seen_ms: int = 0
+    good_pieces: int = 0
+    bad_pieces: int = 0
+    bytes_sent: int = 0
+    bytes_recv: int = 0
+    rtt_ms_ema: float = 0.0
+    trust: float = 0.5
+
+    def score(self) -> float:
+        penalty = (self.bad_pieces * 1.7) + (max(0, self.bad_pieces - self.good_pieces) * 0.8)
+        base = self.trust + (self.good_pieces * 0.05) - (penalty * 0.09)
+        latency_bonus = 0.0
+        if self.rtt_ms_ema > 0:
+            latency_bonus = clamp(700.0 / (self.rtt_ms_ema + 200.0), 0.0, 1.2) * 0.12
+        return clamp(base + latency_bonus, 0.0, 1.0)
+
+    def update_rtt(self, sample_ms: float) -> None:
+        if self.rtt_ms_ema <= 0:
+            self.rtt_ms_ema = float(sample_ms)
