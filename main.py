@@ -1328,3 +1328,73 @@ class KatyTorrentzApp:
         out = s.stats_snapshot()
         out["recent_txs"] = [dataclasses.asdict(x) for x in self.evm.list_recent(limit=18)]
         return out
+
+    def add_torrent_from_path(self, torrent_path: str) -> str:
+        ti = parse_torrent_file(torrent_path)
+        self.db.add_torrent(ti)
+        ih = ti.info_hash.hex()
+        if ih not in self._swarms:
+            store = PieceStore(self.data_dir, ti.info_hash, ti.piece_length, ti.piece_count)
+            self._swarms[ih] = Swarm(ti, self.db, store, self.evm, self.cfg)
+        return ih
+
+    def seed_dummy_pieces(self, info_hash_hex: str, pieces: int) -> None:
+        trow = self.db.get_torrent(info_hash_hex)
+        if not trow:
+            raise TorrentError("torrent not found")
+        raw_info = b64d(t.cast(str, trow["raw_info_b64"]))
+        info = t.cast(dict[bytes, t.Any], bdecode(raw_info))
+        # reconstruct TorrentInfo using stored data
+        piece_length = int(trow["piece_length"])
+        piece_count = int(trow["piece_count"])
+        name = str(trow["name"])
+        # pieces list is not stored in DB; for dummy seeding we generate pseudo pieces
+        # that match the hash list in the original torrent. If that's not available,
+        # we seed "verified=False" and let the user use a real torrent for full integrity.
+        fake_pieces = [sha1(f"{info_hash_hex}:{i}".encode("utf-8")) for i in range(piece_count)]
+        ti = TorrentInfo(
+            name=name,
+            piece_length=piece_length,
+            pieces=fake_pieces,
+            files=[FileEntry(path=name, length=int(trow["total_length"]))],
+            info_hash=bytes.fromhex(info_hash_hex),
+            raw_info_bencode=raw_info,
+        )
+        s = self._swarms.get(info_hash_hex)
+        if not s:
+            store = PieceStore(self.data_dir, ti.info_hash, ti.piece_length, ti.piece_count)
+            s = Swarm(ti, self.db, store, self.evm, self.cfg)
+            self._swarms[info_hash_hex] = s
+        # write N pieces with deterministic content
+        n = max(0, min(int(pieces), ti.piece_count))
+        for i in range(n):
+            data = (f"KatyTorrentz-piece-{i}-" + rand_hex(20)).encode("utf-8")
+            s.store.write_piece(i, data[: ti.piece_length])
+            s._have.set_have(i, True)
+            self.db.update_piece(info_hash_hex, i, have=True, verified=False)
+
+    async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        for s in self._swarms.values():
+            await s.start()
+
+    async def stop(self) -> None:
+        for s in list(self._swarms.values()):
+            await s.stop()
+
+
+# ---------------------------------------------------------------------------
+# CLI + runtime
+# ---------------------------------------------------------------------------
+
+
+def make_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="KatyTorrentz", description="AI-ish torrent sharing app with an EVM settlement lane.")
+    p.add_argument("--data-dir", default=os.path.join(os.getcwd(), "KatyTorrentzData"), help="data directory")
+    p.add_argument("--host", default="127.0.0.1", help="api host")
+    p.add_argument("--port", type=int, default=9877, help="api port")
+    p.add_argument("--chain-id", type=int, default=8453, help="EVM chain id (dry mode)")
+    p.add_argument("--contract", default="0x8b3D5aD3F0cE11a4aD7b09c6C7E1F3a2b4c5D6e7", help="contract address string")
+    p.add_argument("--signer-tag", default="katy-signer-" + secrets.token_hex(6), help="signer label (dry mode)")
+    p.add_argument("--load", action="append", default=[], help="path to .torrent to load on startup (repeatable)")
+    p.add_argument("--log-level", default="INFO", help="DEBUG/INFO/WARN/ERROR")
