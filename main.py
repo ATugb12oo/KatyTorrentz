@@ -1048,3 +1048,73 @@ class Swarm:
                 raise
             except Exception:
                 LOG.exception("timeout tick failed")
+            await asyncio.sleep(0.6 + random.random() * 0.3)
+
+    def _expire_in_flight(self) -> None:
+        dead: list[int] = []
+        nowx = now_ms()
+        for idx, req in self._in_flight.items():
+            if nowx - req.sent_ms > int(self.cfg.request_timeout_s * 1000):
+                dead.append(idx)
+        for idx in dead:
+            req = self._in_flight.pop(idx, None)
+            if not req:
+                continue
+            self._chooser.mark_hot(idx, 0.14)
+            ps = self._peer_stats.get(req.peer_key)
+            if ps:
+                ps.trust = clamp(ps.trust - 0.03, 0.0, 1.0)
+
+    # --- receipt logic ---
+
+    async def _emit_receipt(self, kind: str, piece_idx: int, piece_sha1: bytes) -> None:
+        # digest ties piece, info-hash, and local peer key
+        digest = sha256(
+            stable_json(
+                {
+                    "v": 1,
+                    "kind": kind,
+                    "info_hash": self.info_hash_hex,
+                    "piece": int(piece_idx),
+                    "sha1": piece_sha1.hex(),
+                    "peer": self._local_peer.key,
+                }
+            ).encode("utf-8")
+        )
+        receipt_id = "rcpt_" + secrets.token_hex(10)
+        self.db.add_receipt(receipt_id, self.info_hash_hex, kind, piece_idx, self.cfg.receipt_amount, digest.hex())
+        payload = {
+            "op": "fileSeedProof",
+            "info_hash": self.info_hash_hex,
+            "piece": int(piece_idx),
+            "digest_hex": digest.hex(),
+            "amount": int(self.cfg.receipt_amount),
+            "peer_key": self._local_peer.key,
+        }
+        tr = self.evm.submit(payload)
+        self.db.set_receipt_status(receipt_id, "submitted", tr.tx_id)
+
+    # --- peer book ---
+
+    def _touch_peer(self, peer: PeerIdentity) -> None:
+        ps = self._peer_stats.get(peer.key)
+        if not ps:
+            ps = PeerStats(seen_ms=now_ms(), trust=0.5 + random.random() * 0.08)
+            self._peer_stats[peer.key] = ps
+        ps.seen_ms = now_ms()
+        # keep DB in sync
+        self.db.peer_touch(self.info_hash_hex, peer.key, peer.addr, peer.port, ps.score(), flags=0)
+
+
+# ---------------------------------------------------------------------------
+# Simulation network (local)
+# ---------------------------------------------------------------------------
+
+
+class SimNetwork:
+    _instance: "SimNetwork | None" = None
+
+    @classmethod
+    def get(cls) -> "SimNetwork":
+        if not cls._instance:
+            cls._instance = SimNetwork()
