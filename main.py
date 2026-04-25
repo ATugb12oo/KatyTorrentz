@@ -1118,3 +1118,73 @@ class SimNetwork:
     def get(cls) -> "SimNetwork":
         if not cls._instance:
             cls._instance = SimNetwork()
+        return cls._instance
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._by_torrent: dict[str, dict[str, tuple[PeerIdentity, Swarm]]] = {}
+        self._have_cache: dict[tuple[str, str], bytes] = {}
+
+    def register(self, info_hash_hex: str, peer: PeerIdentity, swarm: Swarm) -> None:
+        with self._lock:
+            d = self._by_torrent.setdefault(info_hash_hex, {})
+            d[peer.key] = (peer, swarm)
+
+    def resolve_peer(self, info_hash_hex: str, peer_key: str) -> PeerIdentity | None:
+        with self._lock:
+            d = self._by_torrent.get(info_hash_hex) or {}
+            v = d.get(peer_key)
+            return v[0] if v else None
+
+    async def broadcast(self, info_hash_hex: str, src: PeerIdentity, msg: dict[str, t.Any]) -> None:
+        with self._lock:
+            peers = list((self._by_torrent.get(info_hash_hex) or {}).values())
+        for peer, swarm in peers:
+            if peer.key == src.key:
+                continue
+            await self.send(info_hash_hex, src, peer, msg)
+
+    def peer_has_piece(self, info_hash_hex: str, peer_key: str, idx: int) -> bool:
+        with self._lock:
+            b = self._have_cache.get((info_hash_hex, peer_key))
+            if not b:
+                return False
+        pm = PieceMap.from_bytes(10_000, b)  # oversized; only first bytes are used
+        try:
+            return pm.have(idx)
+        except Exception:
+            return False
+
+    async def send(self, info_hash_hex: str, src: PeerIdentity, dst: PeerIdentity, msg: dict[str, t.Any]) -> None:
+        await asyncio.sleep(0.02 + random.random() * 0.09)
+        with self._lock:
+            d = self._by_torrent.get(info_hash_hex) or {}
+            pair = d.get(dst.key)
+        if not pair:
+            return
+        _, swarm = pair
+        # keep have cache updated from announce messages
+        if msg.get("t") == "announce":
+            try:
+                pm_b = b64d(t.cast(str, msg.get("have_b64", "")))
+                with self._lock:
+                    self._have_cache[(info_hash_hex, t.cast(str, msg.get("peer_key", "")))] = pm_b
+            except Exception:
+                pass
+        resp = await swarm.on_message(src, msg)
+        if resp and resp.get("t") == "piece":
+            # deliver piece response back to requester
+            with self._lock:
+                req_pair = d.get(src.key)
+            if req_pair:
+                _, src_swarm = req_pair
+                await asyncio.sleep(0.02 + random.random() * 0.07)
+                await src_swarm.on_message(dst, resp)
+
+
+# ---------------------------------------------------------------------------
+# HTTP API
+# ---------------------------------------------------------------------------
+
+
+class ApiServer(http.server.ThreadingHTTPServer):
