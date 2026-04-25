@@ -1398,3 +1398,62 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--signer-tag", default="katy-signer-" + secrets.token_hex(6), help="signer label (dry mode)")
     p.add_argument("--load", action="append", default=[], help="path to .torrent to load on startup (repeatable)")
     p.add_argument("--log-level", default="INFO", help="DEBUG/INFO/WARN/ERROR")
+    return p
+
+
+async def run_app(args: argparse.Namespace) -> None:
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    app = KatyTorrentzApp(data_dir=str(args.data_dir), chain_id=int(args.chain_id), contract_addr=str(args.contract), signer_tag=str(args.signer_tag))
+    try:
+        for path in list(args.load or []):
+            try:
+                ih = app.add_torrent_from_path(path)
+                LOG.info("loaded torrent %s (%s)", path, ih[:16])
+            except Exception as e:
+                LOG.error("failed to load %s: %s", path, e)
+
+        await app.start()
+        srv = KatyAppServer((str(args.host), int(args.port)), app)
+        LOG.info("API listening on http://%s:%s", args.host, args.port)
+
+        # Run HTTP server in thread; asyncio continues doing swarm work.
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+
+        stop_event = asyncio.Event()
+
+        def _sig(*_a: t.Any) -> None:
+            stop_event.set()
+
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, _sig)
+                except NotImplementedError:
+                    signal.signal(sig, lambda *_: _sig())
+        except Exception:
+            pass
+
+        await stop_event.wait()
+        LOG.info("shutting down...")
+        srv.shutdown()
+        await app.stop()
+    finally:
+        app.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = make_parser().parse_args(argv)
+    try:
+        asyncio.run(run_app(args))
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
