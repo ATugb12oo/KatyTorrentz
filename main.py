@@ -1188,3 +1188,73 @@ class SimNetwork:
 
 
 class ApiServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+
+class ApiHandler(http.server.BaseHTTPRequestHandler):
+    server: "KatyAppServer"  # type: ignore[assignment]
+
+    def _send(self, status: int, obj: t.Any) -> None:
+        raw = (stable_json(obj) + "\n").encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _read_json(self) -> dict[str, t.Any]:
+        ln = int(self.headers.get("Content-Length", "0") or "0")
+        if ln <= 0 or ln > 2_000_000:
+            return {}
+        raw = self.rfile.read(ln)
+        try:
+            return t.cast(dict[str, t.Any], json.loads(raw.decode("utf-8")))
+        except Exception:
+            return {}
+
+    def log_message(self, fmt: str, *args: t.Any) -> None:
+        LOG.info("api %s - %s", self.address_string(), fmt % args)
+
+    def do_GET(self) -> None:
+        try:
+            self._route("GET")
+        except Exception as e:
+            LOG.error("api error: %s", e)
+            self._send(500, {"ok": False, "error": str(e), "trace": traceback.format_exc()})
+
+    def do_POST(self) -> None:
+        try:
+            self._route("POST")
+        except Exception as e:
+            LOG.error("api error: %s", e)
+            self._send(500, {"ok": False, "error": str(e), "trace": traceback.format_exc()})
+
+    def _route(self, method: str) -> None:
+        u = urllib.parse.urlparse(self.path)
+        path = u.path.rstrip("/") or "/"
+        qs = urllib.parse.parse_qs(u.query)
+
+        if method == "GET" and path == "/health":
+            self._send(200, {"ok": True, "ts": utc_now().isoformat()})
+            return
+
+        if method == "GET" and path == "/torrents":
+            self._send(200, {"ok": True, "torrents": self.server.app.list_torrents()})
+            return
+
+        if method == "GET" and path == "/swarm":
+            ih = (qs.get("info_hash") or [""])[0]
+            snap = self.server.app.swarm_snapshot(ih)
+            if not snap:
+                self._send(404, {"ok": False, "error": "not found"})
+            else:
+                self._send(200, {"ok": True, "swarm": snap})
+            return
+
+        if method == "GET" and path == "/peers":
+            ih = (qs.get("info_hash") or [""])[0]
+            peers = self.server.app.list_peers(ih)
+            self._send(200, {"ok": True, "peers": peers})
+            return
+
+        if method == "GET" and path == "/receipts":
