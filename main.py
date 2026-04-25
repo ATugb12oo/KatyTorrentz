@@ -908,3 +908,73 @@ class Swarm:
 
     async def on_message(self, peer: PeerIdentity, msg: dict[str, t.Any]) -> dict[str, t.Any] | None:
         mt = msg.get("t")
+        if mt == "announce":
+            return await self._on_announce(peer, msg)
+        if mt == "req_piece":
+            return await self._on_req_piece(peer, msg)
+        if mt == "piece":
+            return await self._on_piece(peer, msg)
+        return {"t": "err", "m": "unknown message"}
+
+    async def _on_announce(self, peer: PeerIdentity, msg: dict[str, t.Any]) -> dict[str, t.Any]:
+        pm_b64 = msg.get("have_b64", "")
+        try:
+            pm = PieceMap.from_bytes(self.ti.piece_count, b64d(pm_b64))
+        except Exception:
+            pm = PieceMap(self.ti.piece_count)
+        self._touch_peer(peer)
+        for i in range(self.ti.piece_count):
+            if pm.have(i):
+                self._availability[i] += 1
+        return {"t": "ack", "peer_key": self._local_peer.key, "at_ms": now_ms()}
+
+    async def _on_req_piece(self, peer: PeerIdentity, msg: dict[str, t.Any]) -> dict[str, t.Any]:
+        idx = int(msg.get("idx", -1))
+        if idx < 0 or idx >= self.ti.piece_count:
+            return {"t": "err", "m": "bad idx"}
+        if not self._have.have(idx):
+            return {"t": "err", "m": "dont_have"}
+        self._touch_peer(peer)
+        data = self.store.read_piece(idx)
+        # send piece; in real BT this would be chunked blocks
+        return {
+            "t": "piece",
+            "idx": idx,
+            "data_b64": b64(data),
+            "sha1_hex": sha1(data).hex(),
+            "sent_ms": now_ms(),
+        }
+
+    async def _on_piece(self, peer: PeerIdentity, msg: dict[str, t.Any]) -> dict[str, t.Any]:
+        idx = int(msg.get("idx", -1))
+        if idx < 0 or idx >= self.ti.piece_count:
+            return {"t": "err", "m": "bad idx"}
+        data_b64 = msg.get("data_b64", "")
+        try:
+            data = b64d(data_b64)
+        except Exception:
+            return {"t": "err", "m": "bad b64"}
+        expected = self.ti.pieces[idx]
+        good = self.store.verify_piece(idx, data, expected)
+        self._touch_peer(peer)
+
+        req = self._in_flight.pop(idx, None)
+        if req:
+            dt = now_ms() - req.sent_ms
+            ps = self._peer_stats.get(peer.key)
+            if ps:
+                ps.update_rtt(dt)
+        ps2 = self._peer_stats.get(peer.key)
+        if ps2:
+            if good:
+                ps2.good_pieces += 1
+                ps2.trust = clamp(ps2.trust + 0.035, 0.0, 1.0)
+            else:
+                ps2.bad_pieces += 1
+                ps2.trust = clamp(ps2.trust - 0.11, 0.0, 1.0)
+                self._chooser.mark_hot(idx, 0.22)
+
+        if good:
+            self.store.write_piece(idx, data)
+            self._have.set_have(idx, True)
+            self.db.update_piece(self.info_hash_hex, idx, have=True, verified=True)
