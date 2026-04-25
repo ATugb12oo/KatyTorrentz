@@ -978,3 +978,73 @@ class Swarm:
             self.store.write_piece(idx, data)
             self._have.set_have(idx, True)
             self.db.update_piece(self.info_hash_hex, idx, have=True, verified=True)
+            self._chooser.mark_hot(idx, -0.12)
+            # create a receipt and submit to EVM dry lane
+            await self._emit_receipt(kind="seed", piece_idx=idx, piece_sha1=sha1(data))
+            return {"t": "ok", "m": "stored", "idx": idx}
+        else:
+            self.db.update_piece(self.info_hash_hex, idx, have=False, verified=False)
+            return {"t": "err", "m": "hash_mismatch", "idx": idx}
+
+    # --- periodic tasks ---
+
+    async def _tick_announce(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self._announce_to_simnet()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("announce tick failed")
+            await asyncio.sleep(self.cfg.announce_interval_s + random.random() * 0.9)
+
+    async def _announce_to_simnet(self) -> None:
+        pm = self._have.to_bytes()
+        msg = {"t": "announce", "peer_key": self._local_peer.key, "have_b64": b64(pm), "at_ms": now_ms()}
+        await self._sim_net.broadcast(self.info_hash_hex, self._local_peer, msg)
+
+    async def _tick_requests(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self._maybe_request()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("request tick failed")
+            await asyncio.sleep(0.35 + random.random() * 0.18)
+
+    async def _maybe_request(self) -> None:
+        if self._have.count() >= self.ti.piece_count:
+            return
+        if len(self._in_flight) >= self.cfg.max_in_flight:
+            return
+
+        peers = sorted(self._peer_stats.items(), key=lambda kv: kv[1].score(), reverse=True)
+        if not peers:
+            return
+        chosen_idx = self._chooser.pick(self._have, set(self._in_flight.keys()), self._availability)
+        if chosen_idx is None:
+            return
+        # choose a peer that likely has it
+        for peer_key, ps in peers[: min(len(peers), self.cfg.max_peer_conns)]:
+            if ps.score() < 0.15:
+                continue
+            remote = self._sim_net.resolve_peer(self.info_hash_hex, peer_key)
+            if not remote:
+                continue
+            if not self._sim_net.peer_has_piece(self.info_hash_hex, peer_key, chosen_idx):
+                continue
+            self._in_flight[chosen_idx] = InFlightReq(idx=chosen_idx, peer_key=peer_key, sent_ms=now_ms())
+            self._chooser.mark_hot(chosen_idx, 0.06)
+            msg = {"t": "req_piece", "peer_key": self._local_peer.key, "idx": chosen_idx, "at_ms": now_ms()}
+            await self._sim_net.send(self.info_hash_hex, self._local_peer, remote, msg)
+            return
+
+    async def _tick_timeouts(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._expire_in_flight()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("timeout tick failed")
