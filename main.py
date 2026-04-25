@@ -1258,3 +1258,73 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if method == "GET" and path == "/receipts":
+            ih = (qs.get("info_hash") or [""])[0]
+            rs = self.server.app.list_receipts(ih)
+            self._send(200, {"ok": True, "receipts": rs})
+            return
+
+        if method == "POST" and path == "/add_torrent":
+            body = self._read_json()
+            p = str(body.get("path", ""))
+            if not p:
+                self._send(400, {"ok": False, "error": "missing path"})
+                return
+            ih = self.server.app.add_torrent_from_path(p)
+            self._send(200, {"ok": True, "info_hash": ih})
+            return
+
+        if method == "POST" and path == "/seed_dummy":
+            body = self._read_json()
+            ih = str(body.get("info_hash", ""))
+            n = int(body.get("pieces", 3))
+            self.server.app.seed_dummy_pieces(ih, n)
+            self._send(200, {"ok": True})
+            return
+
+        self._send(404, {"ok": False, "error": "unknown endpoint"})
+
+
+class KatyAppServer(ApiServer):
+    def __init__(self, addr: tuple[str, int], app: "KatyTorrentzApp"):
+        self.app = app
+        super().__init__(addr, ApiHandler)
+
+
+# ---------------------------------------------------------------------------
+# App core
+# ---------------------------------------------------------------------------
+
+
+class KatyTorrentzApp:
+    def __init__(self, data_dir: str, chain_id: int, contract_addr: str, signer_tag: str):
+        self.data_dir = data_dir
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.db = StateDB(os.path.join(self.data_dir, "katy.db"))
+        self.evm = EVMClient(chain_id=chain_id, contract_address=contract_addr, signer_tag=signer_tag)
+        self.cfg = SwarmConfig()
+        self._swarms: dict[str, Swarm] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def close(self) -> None:
+        self.db.close()
+
+    def list_torrents(self) -> list[dict[str, t.Any]]:
+        return self.db.list_torrents()
+
+    def list_peers(self, info_hash_hex: str) -> list[dict[str, t.Any]]:
+        if not info_hash_hex:
+            return []
+        return self.db.list_peers(info_hash_hex)
+
+    def list_receipts(self, info_hash_hex: str) -> list[dict[str, t.Any]]:
+        if not info_hash_hex:
+            return []
+        return self.db.list_receipts(info_hash_hex)
+
+    def swarm_snapshot(self, info_hash_hex: str) -> dict[str, t.Any] | None:
+        s = self._swarms.get(info_hash_hex)
+        if not s:
+            return None
+        out = s.stats_snapshot()
+        out["recent_txs"] = [dataclasses.asdict(x) for x in self.evm.list_recent(limit=18)]
+        return out
