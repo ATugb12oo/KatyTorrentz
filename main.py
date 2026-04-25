@@ -838,3 +838,73 @@ class InFlightReq:
 
 
 class Swarm:
+    def __init__(
+        self,
+        ti: TorrentInfo,
+        db: StateDB,
+        store: PieceStore,
+        evm: EVMClient,
+        cfg: SwarmConfig,
+    ):
+        self.ti = ti
+        self.db = db
+        self.store = store
+        self.evm = evm
+        self.cfg = cfg
+
+        self._have = db.piece_map(ti.info_hash.hex(), ti.piece_count)
+        self._availability = [0 for _ in range(ti.piece_count)]
+        self._chooser = AIChooser(ti.piece_count)
+        self._peer_stats: dict[str, PeerStats] = {}
+        self._in_flight: dict[int, InFlightReq] = {}
+        self._stop = asyncio.Event()
+        self._tasks: list[asyncio.Task[t.Any]] = []
+
+        self._local_peer = PeerIdentity(
+            peer_id=random_peer_id(),
+            key=secrets.token_hex(10),
+            addr="127.0.0.1",
+            port=random_listen_port(),
+        )
+        self._sim_net = SimNetwork.get()
+        self._sim_net.register(self.ti.info_hash.hex(), self._local_peer, self)
+
+    @property
+    def info_hash_hex(self) -> str:
+        return self.ti.info_hash.hex()
+
+    def stats_snapshot(self) -> dict[str, t.Any]:
+        have_cnt = self._have.count()
+        return {
+            "name": self.ti.name,
+            "info_hash": self.info_hash_hex,
+            "piece_length": self.ti.piece_length,
+            "piece_count": self.ti.piece_count,
+            "total_length": self.ti.total_length,
+            "have_pieces": have_cnt,
+            "have_percent": (have_cnt / max(1, self.ti.piece_count)) * 100.0,
+            "in_flight": len(self._in_flight),
+            "peers_known": len(self._peer_stats),
+            "bytes_stored_dir": self.store._dir,
+        }
+
+    async def start(self) -> None:
+        if self._tasks:
+            return
+        self._tasks = [
+            asyncio.create_task(self._tick_announce(), name=f"announce:{self.info_hash_hex[:8]}"),
+            asyncio.create_task(self._tick_requests(), name=f"requests:{self.info_hash_hex[:8]}"),
+            asyncio.create_task(self._tick_timeouts(), name=f"timeouts:{self.info_hash_hex[:8]}"),
+        ]
+
+    async def stop(self) -> None:
+        self._stop.set()
+        for tsk in list(self._tasks):
+            tsk.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+    # --- peer simulation callbacks ---
+
+    async def on_message(self, peer: PeerIdentity, msg: dict[str, t.Any]) -> dict[str, t.Any] | None:
+        mt = msg.get("t")
